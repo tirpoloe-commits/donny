@@ -1,0 +1,12 @@
+node_modules/
+.tools/
+.npm-cache/
+dev.log
+*.log
+dist/
+.env
+.env.local
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+backend/data/runtime.json
