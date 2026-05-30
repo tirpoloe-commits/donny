@@ -59,4 +59,4 @@ Desde `Admin` puedes:
 - Configurar pasarela de pagos.
 - Configurar Google Analytics, Meta Pixel y Google Tag Manager.
 
-Nota: el backend usa un archivo JSON local para facilitar pruebas en Render. Para produccion real conviene reemplazarlo por PostgreSQL, MongoDB o una base gestionada.
+Nota: el backend usa SQLite local (`backend/data/store.db`) para persistencia ligera. Para produccion real conviene reemplazarlo por PostgreSQL, MongoDB o una base gestionada.

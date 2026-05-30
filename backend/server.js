@@ -3,15 +3,21 @@ import cors from "cors";
 import express from "express";
 import helmet from "helmet";
 import morgan from "morgan";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import Database from "better-sqlite3";
+import jwt from "jsonwebtoken";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 4000;
 const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
 const DATA_DIR = join(__dirname, "data");
-const DATA_FILE = join(DATA_DIR, "runtime.json");
+const DB_FILE = join(DATA_DIR, "store.db");
+const LEGACY_FILE = join(DATA_DIR, "runtime.json");
+
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin123";
+const JWT_SECRET = process.env.JWT_SECRET || "dev_jwt_secret_change_in_prod";
 
 const seed = {
   settings: {
@@ -94,18 +100,18 @@ const seed = {
   leads: []
 };
 
-function ensureStore() {
+function ensureDataDir() {
   if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-  if (!existsSync(DATA_FILE)) writeFileSync(DATA_FILE, JSON.stringify(seed, null, 2));
 }
 
-function readStore() {
-  ensureStore();
-  return JSON.parse(readFileSync(DATA_FILE, "utf8"));
-}
-
-function writeStore(store) {
-  writeFileSync(DATA_FILE, JSON.stringify(store, null, 2));
+function readLegacyStore() {
+  if (!existsSync(LEGACY_FILE)) return null;
+  try {
+    return JSON.parse(readFileSync(LEGACY_FILE, "utf8"));
+  } catch (error) {
+    console.warn("No se pudo leer runtime.json:", error.message);
+    return null;
+  }
 }
 
 function makeId(prefix) {
@@ -116,7 +122,13 @@ function productPayload(body) {
   const name = String(body.name || "").trim();
   const rawSlug = String(body.slug || "").trim();
   const imageUrl = String(body.imageUrl || "").trim();
-  const slug = rawSlug || name.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  const slug = rawSlug ||
+    name
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-|-$/g, "");
 
   return {
     id: body.id || makeId("prod"),
@@ -132,7 +144,204 @@ function productPayload(body) {
   };
 }
 
+function rowToProduct(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    category: row.category,
+    price: Number(row.price),
+    stock: Number(row.stock),
+    sku: row.sku,
+    slug: row.slug,
+    imageUrl: row.imageUrl,
+    description: row.description,
+    featured: Boolean(row.featured)
+  };
+}
+
+function rowToOrder(row) {
+  return {
+    id: row.id,
+    createdAt: row.createdAt,
+    status: row.status,
+    customer: row.customer,
+    phone: row.phone,
+    email: row.email,
+    address: row.address,
+    items: JSON.parse(row.items || "[]"),
+    total: Number(row.total)
+  };
+}
+
+function rowToLead(row) {
+  return {
+    id: row.id,
+    createdAt: row.createdAt,
+    name: row.name,
+    email: row.email,
+    phone: row.phone,
+    message: row.message
+  };
+}
+
+function settingsFromRow(row) {
+  if (!row) return seed.settings;
+  return {
+    whatsapp: row.whatsapp,
+    gateway: row.gateway,
+    ga: row.ga,
+    pixel: row.pixel,
+    gtm: row.gtm,
+    metaDescription: row.metaDescription
+  };
+}
+
+ensureDataDir();
+const db = new Database(DB_FILE);
+
+function initializeDb() {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS settings (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      whatsapp TEXT,
+      gateway TEXT,
+      ga TEXT,
+      pixel TEXT,
+      gtm TEXT,
+      metaDescription TEXT
+    );
+    CREATE TABLE IF NOT EXISTS products (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      category TEXT,
+      price REAL NOT NULL,
+      stock INTEGER NOT NULL,
+      sku TEXT,
+      slug TEXT,
+      imageUrl TEXT,
+      description TEXT,
+      featured INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS orders (
+      id TEXT PRIMARY KEY,
+      createdAt TEXT,
+      status TEXT,
+      customer TEXT,
+      phone TEXT,
+      email TEXT,
+      address TEXT,
+      total REAL,
+      items TEXT
+    );
+    CREATE TABLE IF NOT EXISTS leads (
+      id TEXT PRIMARY KEY,
+      createdAt TEXT,
+      name TEXT,
+      email TEXT,
+      phone TEXT,
+      message TEXT
+    );
+  `);
+}
+
+function seedDatabase() {
+  const count = db.prepare("SELECT COUNT(*) AS count FROM products").get().count;
+  if (count > 0) return;
+  const legacy = readLegacyStore();
+  const data = legacy || seed;
+
+  const insertSettings = db.prepare(`
+    INSERT OR REPLACE INTO settings
+      (id, whatsapp, gateway, ga, pixel, gtm, metaDescription)
+    VALUES (1, ?, ?, ?, ?, ?, ?)
+  `);
+  const insertProduct = db.prepare(`
+    INSERT INTO products
+      (id, name, category, price, stock, sku, slug, imageUrl, description, featured)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const insertOrder = db.prepare(`
+    INSERT OR IGNORE INTO orders
+      (id, createdAt, status, customer, phone, email, address, total, items)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const insertLead = db.prepare(`
+    INSERT OR IGNORE INTO leads
+      (id, createdAt, name, email, phone, message)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+
+  const transaction = db.transaction((initial) => {
+    insertSettings.run(
+      initial.settings.whatsapp,
+      initial.settings.gateway,
+      initial.settings.ga,
+      initial.settings.pixel,
+      initial.settings.gtm,
+      initial.settings.metaDescription
+    );
+
+    for (const product of initial.products) {
+      insertProduct.run(
+        product.id,
+        product.name,
+        product.category,
+        product.price,
+        product.stock,
+        product.sku,
+        product.slug,
+        product.imageUrl || "",
+        product.description,
+        product.featured ? 1 : 0
+      );
+    }
+
+    for (const order of initial.orders || []) {
+      insertOrder.run(
+        order.id,
+        order.createdAt,
+        order.status,
+        order.customer,
+        order.phone,
+        order.email,
+        order.address,
+        order.total,
+        JSON.stringify(order.items || [])
+      );
+    }
+
+    for (const lead of initial.leads || []) {
+      insertLead.run(
+        lead.id,
+        lead.createdAt,
+        lead.name,
+        lead.email,
+        lead.phone,
+        lead.message
+      );
+    }
+  });
+
+  transaction(data);
+}
+
+initializeDb();
+seedDatabase();
+
 const app = express();
+
+function requireAuth(req, res, next) {
+  const auth = req.headers.authorization || "";
+  const m = auth.match(/^Bearer (.+)$/);
+  if (!m) return res.status(401).json({ message: "No autorizado" });
+  try {
+    const payload = jwt.verify(m[1], JWT_SECRET);
+    req.user = payload;
+    next();
+  } catch (err) {
+    return res.status(401).json({ message: "Token inválido" });
+  }
+}
 
 app.use(helmet());
 app.use(
@@ -142,7 +351,7 @@ app.use(
         !origin ||
         origin === FRONTEND_URL ||
         /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin) ||
-        /^https?:\/\/192\.168\.\d+\.\d+(:\d+)?$/.test(origin) ||
+        /^https?:\/\/192\.168\.[0-9]+\.[0-9]+(:\d+)?$/.test(origin) ||
         origin.includes("onrender.com");
 
       if (allowedOrigin) {
@@ -160,90 +369,161 @@ app.options("*", cors());
 app.use(express.json({ limit: "1mb" }));
 app.use(morgan("tiny"));
 
+app.post("/api/login", (req, res) => {
+  const password = String((req.body && req.body.password) || "");
+  if (!password || password !== ADMIN_PASSWORD) {
+    res.status(401).json({ message: "Credenciales inválidas" });
+    return;
+  }
+  const token = jwt.sign({ role: "admin" }, JWT_SECRET, { expiresIn: "8h" });
+  res.json({ token });
+});
+
 app.get("/health", (_req, res) => {
   res.json({ ok: true, service: "ztw-commerce-backend" });
 });
 
 app.get("/api/storefront", (_req, res) => {
-  const store = readStore();
-  res.json({
-    products: store.products,
-    settings: store.settings
-  });
+  const products = db.prepare("SELECT * FROM products ORDER BY rowid DESC").all().map(rowToProduct);
+  const settings = settingsFromRow(db.prepare("SELECT * FROM settings WHERE id = 1").get());
+  res.json({ products, settings });
 });
 
-app.get("/api/admin", (_req, res) => {
-  res.json(readStore());
+app.get("/api/admin", requireAuth, (_req, res) => {
+  const products = db.prepare("SELECT * FROM products ORDER BY rowid DESC").all().map(rowToProduct);
+  const orders = db.prepare("SELECT * FROM orders ORDER BY createdAt DESC").all().map(rowToOrder);
+  const leads = db.prepare("SELECT * FROM leads ORDER BY createdAt DESC").all().map(rowToLead);
+  const settings = settingsFromRow(db.prepare("SELECT * FROM settings WHERE id = 1").get());
+  res.json({ products, orders, leads, settings });
 });
 
-app.post("/api/products", (req, res) => {
-  const store = readStore();
+app.post("/api/products", requireAuth, (req, res) => {
   const payload = productPayload(req.body);
   if (!payload.name || !payload.category || !payload.sku) {
     res.status(400).json({ message: "Faltan campos obligatorios del producto." });
     return;
   }
-  store.products.unshift(payload);
-  writeStore(store);
+
+  db.prepare(`
+    INSERT INTO products
+      (id, name, category, price, stock, sku, slug, imageUrl, description, featured)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    payload.id,
+    payload.name,
+    payload.category,
+    payload.price,
+    payload.stock,
+    payload.sku,
+    payload.slug,
+    payload.imageUrl,
+    payload.description,
+    payload.featured ? 1 : 0
+  );
+
   res.status(201).json(payload);
 });
 
-app.put("/api/products/:id", (req, res) => {
-  const store = readStore();
-  const index = store.products.findIndex((product) => product.id === req.params.id);
-  if (index === -1) {
+app.put("/api/products/:id", requireAuth, (req, res) => {
+  const payload = productPayload({ ...req.body, id: req.params.id });
+  const result = db.prepare(`
+    UPDATE products SET
+      name = ?,
+      category = ?,
+      price = ?,
+      stock = ?,
+      sku = ?,
+      slug = ?,
+      imageUrl = ?,
+      description = ?,
+      featured = ?
+    WHERE id = ?
+  `).run(
+    payload.name,
+    payload.category,
+    payload.price,
+    payload.stock,
+    payload.sku,
+    payload.slug,
+    payload.imageUrl,
+    payload.description,
+    payload.featured ? 1 : 0,
+    payload.id
+  );
+
+  if (result.changes === 0) {
     res.status(404).json({ message: "Producto no encontrado." });
     return;
   }
-  const payload = productPayload({ ...req.body, id: req.params.id });
-  store.products[index] = payload;
-  writeStore(store);
+
   res.json(payload);
 });
 
-app.delete("/api/products/:id", (req, res) => {
-  const store = readStore();
-  store.products = store.products.filter((product) => product.id !== req.params.id);
-  writeStore(store);
+app.delete("/api/products/:id", requireAuth, (req, res) => {
+  db.prepare("DELETE FROM products WHERE id = ?").run(req.params.id);
   res.status(204).end();
 });
 
 app.post("/api/orders", (req, res) => {
-  const store = readStore();
   const order = {
     id: makeId("order"),
     createdAt: new Date().toISOString(),
     status: "Nuevo",
-    customer: req.body.customer,
-    phone: req.body.phone,
-    email: req.body.email,
-    address: req.body.address,
+    customer: String(req.body.customer || "").trim(),
+    phone: String(req.body.phone || "").trim(),
+    email: String(req.body.email || "").trim(),
+    address: String(req.body.address || "").trim(),
     items: Array.isArray(req.body.items) ? req.body.items : [],
     total: Number(req.body.total || 0)
   };
-  store.orders.unshift(order);
-  writeStore(store);
+
+  db.prepare(`
+    INSERT INTO orders
+      (id, createdAt, status, customer, phone, email, address, total, items)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    order.id,
+    order.createdAt,
+    order.status,
+    order.customer,
+    order.phone,
+    order.email,
+    order.address,
+    order.total,
+    JSON.stringify(order.items)
+  );
+
   res.status(201).json(order);
 });
 
 app.post("/api/leads", (req, res) => {
-  const store = readStore();
   const lead = {
     id: makeId("lead"),
     createdAt: new Date().toISOString(),
-    name: req.body.name,
-    email: req.body.email,
-    phone: req.body.phone,
-    message: req.body.message
+    name: String(req.body.name || "").trim(),
+    email: String(req.body.email || "").trim(),
+    phone: String(req.body.phone || "").trim(),
+    message: String(req.body.message || "").trim()
   };
-  store.leads.unshift(lead);
-  writeStore(store);
+
+  db.prepare(`
+    INSERT INTO leads
+      (id, createdAt, name, email, phone, message)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(
+    lead.id,
+    lead.createdAt,
+    lead.name,
+    lead.email,
+    lead.phone,
+    lead.message
+  );
+
   res.status(201).json(lead);
 });
 
-app.put("/api/settings", (req, res) => {
-  const store = readStore();
-  store.settings = {
+app.put("/api/settings", requireAuth, (req, res) => {
+  const nextSettings = {
     whatsapp: String(req.body.whatsapp || "").trim(),
     gateway: String(req.body.gateway || "").trim(),
     ga: String(req.body.ga || "").trim(),
@@ -251,8 +531,28 @@ app.put("/api/settings", (req, res) => {
     gtm: String(req.body.gtm || "").trim(),
     metaDescription: String(req.body.metaDescription || "").trim()
   };
-  writeStore(store);
-  res.json(store.settings);
+
+  db.prepare(`
+    INSERT INTO settings
+      (id, whatsapp, gateway, ga, pixel, gtm, metaDescription)
+    VALUES (1, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      whatsapp = excluded.whatsapp,
+      gateway = excluded.gateway,
+      ga = excluded.ga,
+      pixel = excluded.pixel,
+      gtm = excluded.gtm,
+      metaDescription = excluded.metaDescription
+  `).run(
+    nextSettings.whatsapp,
+    nextSettings.gateway,
+    nextSettings.ga,
+    nextSettings.pixel,
+    nextSettings.gtm,
+    nextSettings.metaDescription
+  );
+
+  res.json(nextSettings);
 });
 
 app.listen(PORT, () => {
