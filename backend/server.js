@@ -9,12 +9,16 @@ import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import jwt from "jsonwebtoken";
 
+console.log("✓ All imports loaded successfully");
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 4000;
 const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
 const DATA_DIR = join(__dirname, "data");
 const DB_FILE = join(DATA_DIR, "store.db");
 const LEGACY_FILE = join(DATA_DIR, "runtime.json");
+
+console.log(`✓ Setup: PORT=${PORT}, DATA_DIR=${DATA_DIR}`);
 
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin123";
 const JWT_SECRET = process.env.JWT_SECRET || "dev_jwt_secret_change_in_prod";
@@ -101,7 +105,13 @@ const seed = {
 };
 
 function ensureDataDir() {
-  if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+  console.log(`📁 Ensuring data directory exists: ${DATA_DIR}`);
+  if (!existsSync(DATA_DIR)) {
+    mkdirSync(DATA_DIR, { recursive: true });
+    console.log("✓ Data directory created");
+  } else {
+    console.log("✓ Data directory already exists");
+  }
 }
 
 function readLegacyStore() {
@@ -197,10 +207,15 @@ function settingsFromRow(row) {
 }
 
 ensureDataDir();
+console.log("✓ ensureDataDir() completed");
+
 const db = new Database(DB_FILE);
+console.log("✓ Database connection established");
 
 function initializeDb() {
-  db.exec(`
+  console.log("🔄 Initializing database...");
+  try {
+    db.exec(`
     CREATE TABLE IF NOT EXISTS settings (
       id INTEGER PRIMARY KEY CHECK (id = 1),
       whatsapp TEXT,
@@ -242,6 +257,11 @@ function initializeDb() {
       message TEXT
     );
   `);
+    console.log("✓ Database tables initialized");
+  } catch (error) {
+    console.error("✗ Database initialization failed:", error.message);
+    throw error;
+  }
 }
 
 function seedDatabase() {
@@ -325,8 +345,15 @@ function seedDatabase() {
   transaction(data);
 }
 
-initializeDb();
-seedDatabase();
+console.log("🚀 Starting server initialization...");
+try {
+  initializeDb();
+  seedDatabase();
+  console.log("✓ Database initialization and seeding completed");
+} catch (error) {
+  console.error("✗ Fatal error during initialization:", error);
+  process.exit(1);
+}
 
 const app = express();
 
@@ -556,5 +583,6 @@ app.put("/api/settings", requireAuth, (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`ZTW backend running on port ${PORT}`);
+  console.log(`✓ ZTW backend running on port ${PORT}`);
+  console.log(`🌐 FRONTEND_URL: ${FRONTEND_URL}`);
 });
