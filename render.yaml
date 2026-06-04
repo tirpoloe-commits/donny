@@ -3,8 +3,8 @@ services:
     name: ztw-commerce-backend
     runtime: node
     rootDir: backend
-    buildCommand: npm install
-    startCommand: npm start
+    buildCommand: cd backend && npm install
+    startCommand: cd backend && npm start
     envVars:
       - key: NODE_ENV
         value: production
@@ -18,7 +18,7 @@ services:
     name: ztw-commerce-frontend
     runtime: static
     rootDir: frontend
-    buildCommand: npm install && npm run build
+    buildCommand: cd frontend && npm install && npm run build
     staticPublishPath: dist
     routes:
       - type: rewrite
